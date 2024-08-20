@@ -4,7 +4,7 @@
 </div>
 <hr>
 
-[![License](...)](LICENSE.md)
+[![License](...)](LICENSE)
 
 # Export and Import
 
