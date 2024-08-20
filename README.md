@@ -4,7 +4,6 @@
 </div>
 <hr>
 
-[![License](...)](LICENSE)
 
 # Export and Import
 
