@@ -1,62 +1,106 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
-	pgPackage "pgPump/internal/postgres"
+	"os/signal"
+	"syscall"
 	"time"
+
+	postgres "pgPump/internal/postgres"
 
 	log "github.com/sirupsen/logrus"
 )
 
-// CustomFormatter implements logrus.Formatter
+// Version is set at build time via -ldflags "-X main.Version=...".
+var Version = "dev"
+
+// CustomFormatter renders log entries as "[timestamp] level: message".
 type CustomFormatter struct{}
 
 func (f *CustomFormatter) Format(entry *log.Entry) ([]byte, error) {
-    timestamp := entry.Time.Format(time.RFC3339)
-    logLine := fmt.Sprintf("[%s] %s: %s\n", timestamp, entry.Level.String(), entry.Message)
-    return []byte(logLine), nil
-}
-
-func main() {
-	setupLogging()
-
-	action, connStr, args := parseFlags()
-
-	pool := pgPackage.CreatePool(connStr)
-	
-	switch action {
-
-		case "export":
-			log.Infof("Exporting tables from schema %s to directory %s using format %s",args.schema, args.dir, args.format)
-			pgPackage.Export(args.dir, args.format, pool, args.schema, args.table, args.columns, args.threads)
-		case "import":
-			log.Infof("Importing from files in %s",args.dir)
-			pgPackage.Import(args.dir, pool, args.schema, args.table, args.columns, args.threads)
-		case "version":
-			fmt.Println("Version: 0.1.0")
-		default:
-			log.Fatal("Expected export or import for command")
-			os.Exit(1)
-	}
-}
-
-func setupLogging() {
-	log.SetLevel(log.InfoLevel)
-	log.SetReportCaller(true)
-	log.SetFormatter(&CustomFormatter{})
+	timestamp := entry.Time.Format(time.RFC3339)
+	logLine := fmt.Sprintf("[%s] %s: %s\n", timestamp, entry.Level.String(), entry.Message)
+	return []byte(logLine), nil
 }
 
 type commandArgs struct {
 	user, password, host, database, sslmode, dir, table, schema, format, columns string
 	port, threads                                                                int
+	verbose                                                                      bool
 }
 
-func parseFlags() (string, string, commandArgs) {
+func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
+	if len(os.Args) < 2 {
+		return fmt.Errorf("expected 'export', 'import', or 'version' command")
+	}
+
+	action := os.Args[1]
+	switch action {
+	case "version", "--version", "-version":
+		fmt.Printf("pgPump %s\n", Version)
+		return nil
+	case "help", "--help", "-h":
+		printUsage()
+		return nil
+	case "export", "import":
+		// handled below
+	default:
+		printUsage()
+		return fmt.Errorf("unknown command %q: expected 'export', 'import', or 'version'", action)
+	}
+
+	args, connStr, err := parseFlags()
+	if err != nil {
+		return err
+	}
+
+	setupLogging(args.verbose)
+
+	// Root context cancelled on SIGINT/SIGTERM so in-flight COPY operations
+	// can be aborted cleanly.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	pool, err := postgres.CreatePool(ctx, connStr)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+
+	switch action {
+	case "export":
+		log.Infof("Exporting tables from schema %s to directory %s using format %s", args.schema, args.dir, args.format)
+		return postgres.Export(ctx, args.dir, args.format, pool, args.schema, args.table, args.columns, args.threads)
+	case "import":
+		log.Infof("Importing files from %s into schema %s", args.dir, args.schema)
+		return postgres.Import(ctx, args.dir, pool, args.schema, args.table, args.columns, args.threads)
+	}
+
+	return nil
+}
+
+func setupLogging(verbose bool) {
+	level := log.InfoLevel
+	if verbose {
+		level = log.DebugLevel
+	}
+	log.SetLevel(level)
+	log.SetReportCaller(true)
+	log.SetFormatter(&CustomFormatter{})
+}
+
+func parseFlags() (commandArgs, string, error) {
 	const (
 		defaultUser     = "postgres"
-		defaultPassword = ""
 		defaultHost     = "localhost"
 		defaultDatabase = "postgres"
 		defaultSSLMode  = "disable"
@@ -67,30 +111,25 @@ func parseFlags() (string, string, commandArgs) {
 		defaultThread   = 1
 	)
 
-	actionCmd := flag.NewFlagSet("action", flag.ExitOnError)
+	fs := flag.NewFlagSet(os.Args[1], flag.ContinueOnError)
+	fs.Usage = printUsage
 
-	user := actionCmd.String("user", defaultUser, "Username for database connection")
-	password := actionCmd.String("password", defaultPassword, "Database password")
-	host := actionCmd.String("host", defaultHost, "Host of the database")
-	database := actionCmd.String("database", defaultDatabase, "Database name")
-	sslmode := actionCmd.String("sslmode", defaultSSLMode, "Postgres SSL Mode")
-	dir := actionCmd.String("dir", defaultDir, "Directory to process")
-	table := actionCmd.String("table", "", "Table to load or export")
-	schemaName := actionCmd.String("schema", defaultSchema, "Schema of table(s) to load or export")
-	format := actionCmd.String("format", defaultFormat, "Format of dump file (binary or csv)")
-	columns := actionCmd.String("columns", "all", "Comma-separated list of columns to export")
-	port := actionCmd.Int("port", defaultPort, "Port number for database connection")
-	threadLimit := actionCmd.Int("parallel", defaultThread, "Number of concurrent threads to perform exports")
+	user := fs.String("user", envOr("PGUSER", defaultUser), "Username for database connection")
+	password := fs.String("password", "", "Database password (falls back to PGPASSWORD)")
+	host := fs.String("host", envOr("PGHOST", defaultHost), "Host of the database")
+	database := fs.String("database", envOr("PGDATABASE", defaultDatabase), "Database name")
+	sslmode := fs.String("sslmode", envOr("PGSSLMODE", defaultSSLMode), "Postgres SSL mode")
+	dir := fs.String("dir", defaultDir, "Directory to process")
+	table := fs.String("table", "", "Table to load or export")
+	schemaName := fs.String("schema", defaultSchema, "Schema of table(s) to load or export")
+	format := fs.String("format", defaultFormat, "Format of dump file (binary or csv)")
+	columns := fs.String("columns", "all", "Comma-separated list of columns to export")
+	port := fs.Int("port", defaultPort, "Port number for database connection")
+	threadLimit := fs.Int("parallel", defaultThread, "Number of concurrent threads to perform exports/imports")
+	verbose := fs.Bool("verbose", false, "Enable debug logging")
 
-
-	// Ensure at least one argument is passed for action
-	if len(os.Args) < 2 {
-		log.Fatal("Expected 'export', 'import', or 'version' command")
-		os.Exit(1)
-	}
-
-	if err := actionCmd.Parse(os.Args[2:]); err != nil {
-		log.Fatalf("Failed to parse flags: %v", err)
+	if err := fs.Parse(os.Args[2:]); err != nil {
+		return commandArgs{}, "", err
 	}
 
 	args := commandArgs{
@@ -106,10 +145,19 @@ func parseFlags() (string, string, commandArgs) {
 		columns:  *columns,
 		port:     *port,
 		threads:  *threadLimit,
+		verbose:  *verbose,
 	}
 
 	if args.password == "" {
 		args.password = os.Getenv("PGPASSWORD")
+	}
+
+	if args.format != "binary" && args.format != "csv" {
+		return commandArgs{}, "", fmt.Errorf("invalid format %q: expected 'binary' or 'csv'", args.format)
+	}
+
+	if args.threads < 1 {
+		return commandArgs{}, "", fmt.Errorf("--parallel must be at least 1")
 	}
 
 	if args.columns != "all" {
@@ -118,9 +166,40 @@ func parseFlags() (string, string, commandArgs) {
 		args.columns = ""
 	}
 
-	action := os.Args[1]
+	connStr := fmt.Sprintf("host=%s port=%d dbname=%s sslmode=%s user=%s password=%s",
+		args.host, args.port, args.database, args.sslmode, args.user, args.password)
 
-	connStr := fmt.Sprintf("host=%s port=%d dbname=%s sslmode=%s user=%s password=%s", args.host, args.port, args.database, args.sslmode, args.user, args.password)
+	return args, connStr, nil
+}
 
-	return action, connStr, args
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func printUsage() {
+	fmt.Fprint(os.Stderr, `pgPump - PostgreSQL data export and import
+
+Usage:
+  pgpump export|import [flags]
+  pgpump version
+  pgpump help
+
+Flags:
+  --user      Postgres user (default "postgres", env PGUSER)
+  --password  Postgres password (env PGPASSWORD)
+  --host      Postgres host (default "localhost", env PGHOST)
+  --port      Postgres port (default 5432)
+  --database  Database name (default "postgres", env PGDATABASE)
+  --schema    Schema of table(s) (default "public")
+  --table     Restrict to a single table
+  --columns   Comma-separated column list, used with --table (default "all")
+  --dir       Directory for dump files (default ".")
+  --format    Dump format: binary or csv (default "binary")
+  --parallel  Number of concurrent workers (default 1)
+  --sslmode   Postgres SSL mode (default "disable", env PGSSLMODE)
+  --verbose   Enable debug logging
+`)
 }

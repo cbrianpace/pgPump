@@ -1,104 +1,73 @@
-package pgPackage
+package postgres
 
 import (
 	"context"
 	"fmt"
 	"os"
-	"sync"
+	"path/filepath"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	log "github.com/sirupsen/logrus"
 )
 
-func Export(dir string, dumpFormat string, pool *pgxpool.Pool, schema string, table string, columnList string, threads int) {
+// Export writes one dump file per table in the schema to dir, running up to
+// `threads` exports concurrently. It returns an error only if the set of tables
+// cannot be determined or if any individual table export fails.
+func Export(ctx context.Context, dir string, format string, pool *pgxpool.Pool, schema string, table string, columnList string, threads int) error {
 	start := time.Now()
 
-	// Get Tables to Export
-	tables := GetTablesForSchema(pool, schema, table)
+	tables, err := GetTablesForSchema(ctx, pool, schema, table)
+	if err != nil {
+		return err
+	}
+	if len(tables) == 0 {
+		return fmt.Errorf("no tables found in schema %q", schema)
+	}
 
 	log.Infof("Running with a maximum of %d threads to export %d tables", threads, len(tables))
 
-	// Semaphore channel to limit concurrent goroutines
-	semaphore := make(chan struct{}, threads)
+	success, failed := runParallel(ctx, tables, threads, func(name string) task {
+		return func(ctx context.Context) error {
+			return ExportTable(ctx, dir, format, pool, schema, name, columnList)
+		}
+	})
 
-	// Channel to collect results
-	results := make(chan string, len(tables))
+	log.Infof("Exports complete (%d total, %d successful, %d failed) in %.3f seconds",
+		len(tables), success, failed, time.Since(start).Seconds())
 
-	// WaitGroup to wait for all goroutines to finish
-	var wg sync.WaitGroup
-
-	i := 0
-	failedCnt := 0
-	successCnt := 0
-
-	for _, tableName := range tables {
-		i++
-		wg.Add(1)
-		semaphore <- struct{}{} // Acquire a slot in the semaphore
-
-		go func(taskID int) {
-			defer wg.Done()
-			defer func() { <-semaphore }() // Release the slot in the semaphore
-
-			err := ExportTable(dir, dumpFormat, pool, schema, tableName, columnList)
-			if err != nil {
-				failedCnt++
-				results <- fmt.Sprintf("Table %s failed: %v", tableName, err)
-			} else {
-				successCnt++
-				results <- fmt.Sprintf("Table %s succeeded", tableName)
-			}
-		}(i)
+	if failed > 0 {
+		return fmt.Errorf("%d of %d table exports failed", failed, len(tables))
 	}
-
-	// Close results channel once all tasks are done
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	// Collect and print results
-	for result := range results {
-		log.Info(result)
-	}
-
-	log.Infof("Exports complete (%d total, %d successful, %d failed) in %.3f seconds",len(tables),successCnt,failedCnt, time.Since(start).Seconds())
-							
+	return nil
 }
 
-func ExportTable(dir string, dumpFormat string, pool *pgxpool.Pool, schema string, table string, columnList string) error {
-
+// ExportTable copies a single table to a dump file named DATA_<table>.<ext>.
+func ExportTable(ctx context.Context, dir string, format string, pool *pgxpool.Pool, schema string, table string, columnList string) error {
 	start := time.Now()
-	
-	log.Infof("Exporting table %s.%s",schema,table)
+	log.Infof("Exporting table %s.%s", schema, table)
 
-	// Open a file to write the data
-	fileName := fmt.Sprintf("%s/DATA_%s.%s",dir,table,(dumpFormat)[:3])
+	fileName := filepath.Join(dir, fmt.Sprintf("DATA_%s.%s", table, format[:3]))
 	outputFile, err := os.Create(fileName)
 	if err != nil {
-		log.Fatalf("Failed to create file: %v\n", err)
-		return err
+		return fmt.Errorf("creating file %s: %w", fileName, err)
 	}
 	defer outputFile.Close()
 
-	sqlQuery := fmt.Sprintf("COPY %s.%s %s TO stdout WITH %s",schema,table,columnList,dumpFormat)
+	relation := pgx.Identifier{schema, table}.Sanitize()
+	sqlQuery := fmt.Sprintf("COPY %s %s TO STDOUT WITH (FORMAT %s)", relation, columnList, format)
 
-	// Execute the COPY TO STDOUT command
-	conn, err := pool.Acquire(context.Background())
+	conn, err := pool.Acquire(ctx)
 	if err != nil {
-		log.Fatalf("Failed to acquire connection: %v\n", err)
-		return err
+		return fmt.Errorf("acquiring connection: %w", err)
 	}
 	defer conn.Release()
 
-	_, err = conn.Conn().PgConn().CopyTo(context.Background(), outputFile, sqlQuery)
-	if err != nil {
-		log.Fatalf("Failed to execute COPY TO STDOUT: %v\n", err)
-		return err
+	if _, err := conn.Conn().PgConn().CopyTo(ctx, outputFile, sqlQuery); err != nil {
+		return fmt.Errorf("COPY TO STDOUT for %s: %w", relation, err)
 	}
 
-	log.Infof("Exported table %s.%s to %s in %.3f seconds",schema,table, fileName, time.Since(start).Seconds())				
-
+	log.Infof("Exported table %s.%s to %s in %.3f seconds", schema, table, fileName, time.Since(start).Seconds())
 	return nil
 }

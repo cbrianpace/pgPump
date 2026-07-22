@@ -1,46 +1,47 @@
-package pgPackage
+package postgres
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	log "github.com/sirupsen/logrus"
 )
 
-func GetTablesForSchema(pool *pgxpool.Pool, schemaName string, table string) []string {
-	log.Infof("Getting tables for schema %s",schemaName)
+// GetTablesForSchema returns the base tables in the given schema. When table is
+// non-empty, only that table is returned (if it exists).
+func GetTablesForSchema(ctx context.Context, pool *pgxpool.Pool, schemaName string, table string) ([]string, error) {
+	log.Infof("Getting tables for schema %s", schemaName)
 
-    // SQL query to retrieve the list of tables for a specific schema
-    query := `
-        SELECT table_name 
-        FROM information_schema.tables 
-        WHERE table_schema = $1 AND table_type = 'BASE TABLE'
-    `
+	query := `
+		SELECT table_name
+		FROM information_schema.tables
+		WHERE table_schema = $1 AND table_type = 'BASE TABLE'`
+	args := []any{schemaName}
 
-	// Execute the query
-	var tables []string
-	
 	if table != "" {
-		query += " AND table_name = '" + table + "'"
+		query += " AND table_name = $2"
+		args = append(args, table)
 	}
 
-    rows, err := pool.Query(context.Background(), query, schemaName)
-
+	rows, err := pool.Query(ctx, query, args...)
 	if err != nil {
-		log.Fatalf("Error retreiving list of tables %s",err)
+		return nil, fmt.Errorf("retrieving list of tables: %w", err)
 	}
+	defer rows.Close()
 
+	var tables []string
 	for rows.Next() {
 		var tableName string
-		err := rows.Scan(&tableName)
-		if err != nil {
-			log.Fatalf("Error parsing list of tables %s",err)
+		if err := rows.Scan(&tableName); err != nil {
+			return nil, fmt.Errorf("parsing list of tables: %w", err)
 		}
-
 		log.Infof("Discovered table %s", tableName)
-
 		tables = append(tables, tableName)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating list of tables: %w", err)
+	}
 
-    return tables
+	return tables, nil
 }

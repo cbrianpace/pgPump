@@ -1,6 +1,7 @@
-package DataFile
+package datafile
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,34 +14,32 @@ const (
 	binExtension = ".bin"
 )
 
-func GetFilesInDir (dir string, fileFilter string) []string {
+// GetFilesInDir returns the names of dump files in dir whose names start with
+// fileFilter and carry a recognized (.csv or .bin) extension.
+func GetFilesInDir(dir string, fileFilter string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("reading directory %s: %w", dir, err)
+	}
+
 	var fileList []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
 
-	// Open the directory
-    files, err := os.ReadDir(dir)
-    if err != nil {
-        log.Fatalf("Failed to read directory: %v", err)
-    }
+		name := entry.Name()
+		if !strings.HasPrefix(name, fileFilter) {
+			continue
+		}
 
-	for _, file := range files {
-
-		if file.IsDir() {
-            continue // Skip directories
-        }
-
-		if strings.HasPrefix(file.Name(), fileFilter) {
-			// Get the file extension
-			extension := filepath.Ext(file.Name())
-
-			if strings.Contains(extension, csvExtension) || strings.Contains(extension, binExtension) {
-				fileList = append(fileList, file.Name())
-			} else {
-				log.Warnf("Invalid file format %s, skipping files",extension)
-				continue
-			}
+		switch filepath.Ext(name) {
+		case csvExtension, binExtension:
+			fileList = append(fileList, name)
+		default:
+			log.Warnf("Skipping file with unsupported extension: %s", name)
 		}
 	}
 
-	return fileList
-
+	return fileList, nil
 }

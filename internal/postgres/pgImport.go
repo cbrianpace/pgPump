@@ -1,4 +1,4 @@
-package pgPackage
+package postgres
 
 import (
 	"context"
@@ -6,135 +6,112 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
-	DataFile "pgPump/internal/datafile"
+	datafile "pgPump/internal/datafile"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	log "github.com/sirupsen/logrus"
 )
 
-func Import (dir string, pool *pgxpool.Pool, schema string, table string, columnList string, threads int) {
+const dumpFilePrefix = "DATA_"
+
+// Import loads every dump file in dir into the target schema, running up to
+// `threads` imports concurrently. When table is non-empty, only that table's
+// dump file is imported.
+func Import(ctx context.Context, dir string, pool *pgxpool.Pool, schema string, table string, columnList string, threads int) error {
 	start := time.Now()
 
-	fileFilter := "DATA_"
-
+	fileFilter := dumpFilePrefix
 	if table != "" {
 		fileFilter += table + "."
 	}
-	
-	fileList := DataFile.GetFilesInDir(dir, fileFilter)
+
+	fileList, err := datafile.GetFilesInDir(dir, fileFilter)
+	if err != nil {
+		return err
+	}
+	if len(fileList) == 0 {
+		return fmt.Errorf("no dump files matching %q found in %s", fileFilter, dir)
+	}
 
 	log.Infof("Running with a maximum of %d threads to import %d files", threads, len(fileList))
 
-	// Semaphore channel to limit concurrent goroutines
-	semaphore := make(chan struct{}, threads)
-
-	// Channel to collect results
-	results := make(chan string, len(fileList))
-
-	// WaitGroup to wait for all goroutines to finish
-	var wg sync.WaitGroup
-
-	i := 0
-	failedCnt := 0
-	successCnt := 0
-	
-    // Loop through the files in the directory
-    for _, file := range fileList {
-		var tableName string
-
-		parts := strings.Split(file, "_")
-		if len(parts) > 1 {
-			tableName = strings.Join(parts[1:], "_")
-			tableName = tableName[:len(tableName)-4]
-		} else {
-			message := fmt.Sprintf("Failed to parse file %s", file)
-			log.Error(message)
-			failedCnt++
-			continue
-		}
-		
-		extension := filepath.Ext(file)
-		fileType := "binary"
-
-		switch extension {
-		case ".csv":
-			fileType = "csv"
-		case ".bin":
-			fileType = "binary"
-		}
-
-		i++
-		wg.Add(1)
-		semaphore <- struct{}{} // Acquire a slot in the semaphore
-
-		go func(taskID int) {
-			defer wg.Done()
-			defer func() { <-semaphore }() // Release the slot in the semaphore
-
-			err := ImportFile(dir, file, pool, fileType, schema, tableName, columnList)
+	success, failed := runParallel(ctx, fileList, threads, func(file string) task {
+		return func(ctx context.Context) error {
+			tableName, fileType, err := parseDumpFileName(file)
 			if err != nil {
-				failedCnt++
-				results <- fmt.Sprintf("File %s failed: %v", file, err)
-			} else {
-				successCnt++
-				results <- fmt.Sprintf("File %s succeeded", file)
+				return err
 			}
-		}(i)
+			return ImportFile(ctx, dir, file, pool, fileType, schema, tableName, columnList)
+		}
+	})
+
+	log.Infof("Imports complete (%d total, %d successful, %d failed) in %.3f seconds",
+		len(fileList), success, failed, time.Since(start).Seconds())
+
+	if failed > 0 {
+		return fmt.Errorf("%d of %d file imports failed", failed, len(fileList))
 	}
-
-	// Close results channel once all tasks are done
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	// Collect and print results
-	for result := range results {
-		log.Info(result)
-	}
-
-	log.Infof("Imports complete (%d total, %d successful, %d failed) in %.3f seconds",len(fileList),successCnt,failedCnt, time.Since(start).Seconds())
-
+	return nil
 }
 
+// parseDumpFileName derives the table name and COPY format from a dump file
+// name of the form DATA_<table>.<bin|csv>. The table name may itself contain
+// underscores.
+func parseDumpFileName(file string) (tableName string, fileType string, err error) {
+	base := filepath.Base(file)
+	ext := filepath.Ext(base)
 
-func ImportFile (dir string, fileName string, pool *pgxpool.Pool, fileType string, schema string, tableName string, columnList string) error {
+	switch ext {
+	case ".csv":
+		fileType = "csv"
+	case ".bin":
+		fileType = "binary"
+	default:
+		return "", "", fmt.Errorf("unrecognized dump file extension %q for %s", ext, file)
+	}
+
+	name := strings.TrimSuffix(base, ext)
+	if !strings.HasPrefix(name, dumpFilePrefix) {
+		return "", "", fmt.Errorf("file %s missing %q prefix", file, dumpFilePrefix)
+	}
+	tableName = strings.TrimPrefix(name, dumpFilePrefix)
+	if tableName == "" {
+		return "", "", fmt.Errorf("could not parse table name from file %s", file)
+	}
+
+	return tableName, fileType, nil
+}
+
+// ImportFile loads a single dump file into schema.table via COPY FROM STDIN.
+func ImportFile(ctx context.Context, dir string, fileName string, pool *pgxpool.Pool, fileType string, schema string, tableName string, columnList string) error {
 	start := time.Now()
-	fullFileName := dir + "/" + fileName
-	
-	log.Infof("Importing %s table %s.%s",fullFileName,schema,tableName)
+	fullFileName := filepath.Join(dir, fileName)
 
-	// Open a file to read the data
+	log.Infof("Importing %s into table %s.%s", fullFileName, schema, tableName)
+
 	inputFile, err := os.Open(fullFileName)
 	if err != nil {
-		log.Fatalf("Failed to create file: %v\n", err)
-		return err
+		return fmt.Errorf("opening file %s: %w", fullFileName, err)
 	}
 	defer inputFile.Close()
 
-	sqlQuery := fmt.Sprintf("COPY %s.%s %s  FROM STDIN WITH %s",schema,tableName,columnList,fileType)
+	relation := pgx.Identifier{schema, tableName}.Sanitize()
+	sqlQuery := fmt.Sprintf("COPY %s %s FROM STDIN WITH (FORMAT %s)", relation, columnList, fileType)
+	log.Debugf("executing: %s", sqlQuery)
 
-	println(sqlQuery)
-
-	// Execute the COPY FROM STDIN command
-	conn, err := pool.Acquire(context.Background())
+	conn, err := pool.Acquire(ctx)
 	if err != nil {
-		log.Fatalf("Failed to acquire connection: %v\n", err)
-		return err
+		return fmt.Errorf("acquiring connection: %w", err)
 	}
 	defer conn.Release()
 
-	_, err = conn.Conn().PgConn().CopyFrom(context.Background(), inputFile, sqlQuery)
-	if err != nil {
-		log.Fatalf("Failed to execute COPY FROM STDIN: %v\n", err)
-		return err
+	if _, err := conn.Conn().PgConn().CopyFrom(ctx, inputFile, sqlQuery); err != nil {
+		return fmt.Errorf("COPY FROM STDIN for %s: %w", relation, err)
 	}
 
-	log.Infof("Imported table %s.%s from %s in %.3f seconds",schema,tableName, fileName, time.Since(start).Seconds())				
-
+	log.Infof("Imported table %s.%s from %s in %.3f seconds", schema, tableName, fileName, time.Since(start).Seconds())
 	return nil
-
 }
