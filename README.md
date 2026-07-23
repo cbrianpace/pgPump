@@ -56,13 +56,13 @@ To perform the export, simply executed the compiled version of the code or using
 ### Compiled
 
 ```shell
-pgpump export --user=postgres --password=$PGPASSWORD --host=127.0.0.1 --database=mlb --schema=mlb  --dir=/app/temp/data
+pgpump export --user=postgres --password="$PGPASSWORD" --host=127.0.0.1 --database=mlb --schema=mlb  --dir=/app/temp/data
 ```
 
 ### Using `go run`
 
 ```shell
-go run cmd/pgpump/main.go export --user=postgres --password=$PGPASSWORD --host=127.0.0.1 --database=mlb --schema=mlb  --dir=/app/temp/data
+go run cmd/pgpump/main.go export --user=postgres --password="$PGPASSWORD" --host=127.0.0.1 --database=mlb --schema=mlb  --dir=/app/temp/data
 ```
 
 In the above example, the minimal required parameters are presented.  If the `--password` is not provided, the application will pull the password from the PGPASSWORD environment variable.
@@ -78,13 +78,13 @@ To perform the import, simply executed the compiled version of the code or using
 ### Compiled
 
 ```shell
-pgpump import --user=postgres --password=$PGPASSWORD --host=127.0.0.1 --database=mlb --schema=mlb  --dir=/app/temp/data
+pgpump import --user=postgres --password="$PGPASSWORD" --host=127.0.0.1 --database=mlb --schema=mlb  --dir=/app/temp/data
 ```
 
 ### Using `go run`
 
 ```shell
-go run cmd/pgpump/main.go import --user=postgres --password=$PGPASSWORD --host=127.0.0.1 --database=mlb --schema=mlb  --dir=/app/temp/data
+go run cmd/pgpump/main.go import --user=postgres --password="$PGPASSWORD" --host=127.0.0.1 --database=mlb --schema=mlb  --dir=/app/temp/data
 ```
 
 In the above example, the minimal required parameters are presented.  If the `--password` is not provided, the application will pull the password from the PGPASSWORD environment variable.  The connection information and the schema should point to the desired target for the imported data.

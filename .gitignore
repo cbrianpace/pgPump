@@ -11,6 +11,13 @@
 # Test binary, built with `go test -c`
 *.test
 
+# Compiled binaries (Makefile builds to bin/)
+/bin/
+/main
+/pgpump
+/cmd/pgpump/main
+/cmd/pgpump/pgpump
+
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
 
